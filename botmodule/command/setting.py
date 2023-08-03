@@ -2,17 +2,21 @@ import asyncio
 import contextlib
 from copy import deepcopy
 from typing import Union, List
+
+import async_timeout
 from loguru import logger
 from pyrogram import types, Client
 from pyrogram.errors import RPCError
 from pyrogram.types import BotCommand, CallbackQuery, Message
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton as IKB
+from pyrogram.handlers import CallbackQueryHandler
 from utils.cleaner import addon, config, ArgCleaner
 from utils.myqueue import bot_put
 from utils.check import get_telegram_id_from_message as getID
 from utils import message_delete_queue as mdq
 from glovar import __version__
 from botmodule.rule import get_rule
+
 from botmodule.init_bot import latest_version_hash as v_hash
 from botmodule.command.authority import (Invite, INVITE_SELECT_CACHE as ISC,
                                          BOT_MESSAGE_CACHE, generate_random_string as genkey)
@@ -69,6 +73,8 @@ sc = select_cache = {
     'sort': {},  # 记录排序选择
     'slaveid': {},  # 记录后端id选择
 }
+api_route = '/api/getSlaveId'
+receiver = {}
 
 
 def reload_button():
@@ -338,15 +344,15 @@ def get_slave_id(message: Message) -> str:
     return sc['slaveid'].pop(k, "local")
 
 
-def page_frame(pageprefix: str, contentprefix, content: List[str], **kwargs) -> list:
+def page_frame(pageprefix: str, contentprefix: str, content: List[str], split: str = ':', **kwargs) -> list:
     """
     翻页框架，返回一个内联键盘列表：[若干行的内容按钮,(上一页、页数预览、下一页）按钮]
     pageprefix: 页面回调数据的前缀字符串
     contentprefix: 具体翻页内容的回调数据的前缀字符串
     """
-    page = kwargs.get('page', 1)
-    row = kwargs.get('row', 5)
-    column = kwargs.get('column', 1)
+    page = int(kwargs.get('page', 1))
+    row = int(kwargs.get('row', 5))
+    column = int(kwargs.get('column', 1))
     max_page = int(len(content) / (row * column)) + 1
     pre_page_text = page - 1 if page - 1 > 0 else 1
     next_page_text = page + 1 if page < max_page else max_page
@@ -370,7 +376,7 @@ def page_frame(pageprefix: str, contentprefix, content: List[str], **kwargs) -> 
             if i % column == 0 and i != 0:
                 content_keyboard.append(deepcopy(temp_row))
                 temp_row.clear()
-            temp_row.append(IKB(c, f'{contentprefix}:{c}'))
+            temp_row.append(IKB(c, f'{contentprefix}{split}{c}'))
         content_keyboard.append(deepcopy(temp_row))
     else:
         content_keyboard = []
@@ -379,7 +385,7 @@ def page_frame(pageprefix: str, contentprefix, content: List[str], **kwargs) -> 
             if i % column == 0 and i != 0:
                 content_keyboard.append(deepcopy(temp_row))
                 temp_row.clear()
-            temp_row.append(IKB(c, f'{contentprefix}:{c}'))
+            temp_row.append(IKB(c, f'{contentprefix}{split}{c}'))
         content_keyboard.append(deepcopy(temp_row))
     content_keyboard.append([pre_page, preview, next_page])
     return content_keyboard
@@ -409,7 +415,11 @@ async def task_handler(app: Client, message: Message, **kwargs):
         await select_slave_page(app, message, **kwargs)
 
 
-async def select_slave_page(_: Client, call: Union[CallbackQuery, Message], **kwargs):
+async def select_slave_page(_: Client, call: Union[CallbackQuery, Message], content_prefix: str = "slave:", **kwargs):
+    """
+    选择后端页面的入口
+    content_prefix: 后端的回调按钮数据的前缀，默认为slave:
+    """
     slaveconfig = config.getSlaveconfig()
 
     comment = [i.get('comment', None) for k, i in slaveconfig.items() if
@@ -431,11 +441,11 @@ async def select_slave_page(_: Client, call: Union[CallbackQuery, Message], **kw
         pre_page.text = '        '
         pre_page.callback_data = 'blank'
     if page == max_page:
-        content_keyboard = [[IKB(c, 'slave:' + c)] for c in comment[(max_page - 1) * row:]]
+        content_keyboard = [[IKB(c, content_prefix + c)] for c in comment[(max_page - 1) * row:]]
         next_page.text = '        '
         next_page.callback_data = 'blank'
     else:
-        content_keyboard = [[IKB(c, 'slave:' + c)] for c in comment[(page - 1) * row:page * row]]
+        content_keyboard = [[IKB(c, content_prefix + c)] for c in comment[(page - 1) * row:page * row]]
     content_keyboard.insert(0, [dbtn['b_slave']])
     content_keyboard.append([pre_page, blank, next_page])
     content_keyboard.append([dbtn['b_cancel']])
@@ -469,6 +479,77 @@ async def select_task(app: Client, originmsg: Message, slaveid: str, sort: str, 
     else:
         await originmsg.reply("🐛暂时未适配")
         return
+
+
+# async def select_slave_()
+async def select_slave_only_pre(_: Client, call: Union[CallbackQuery, Message], **kwargs):
+    """
+    receiver: 指定一个列表变量，它将作为slaveid的接收者。
+    """
+    page_prefix = '/api/slave/page/'
+    page = 1 if isinstance(call, Message) else call.data[len(page_prefix)]
+    slaveconfig = config.getSlaveconfig()
+    comment = [i.get('comment', None) for k, i in slaveconfig.items() if
+               i.get('comment', None) and k != "default-slave"]
+    content_keyboard = page_frame(page_prefix, api_route, comment, split='?comment=', page=page, **kwargs)
+    content_keyboard.append([dbtn['b_close']])
+
+    IKM = InlineKeyboardMarkup(content_keyboard)
+    target = call.message if isinstance(call, CallbackQuery) else call
+    if isinstance(call, CallbackQuery):
+        await target.edit_text(target.text, reply_markup=IKM)
+    else:
+        return await target.reply(f"请选择测试后端, 你有{kwargs.get('timeout', 60)}s的时间选择:\n", quote=True, reply_markup=IKM)
+
+
+async def get_s_id(_: Client, c: CallbackQuery):
+    le = len(api_route) + len("?comment=")
+    key = gen_msg_key(c.message)
+    if key in receiver:
+        q = receiver[key]
+        try:
+            if isinstance(q, asyncio.Queue):
+                q.put_nowait(str(c.data)[le:])
+        except asyncio.queues.QueueFull:
+            return
+    else:
+        await c.message.reply("❌无法找到该消息与之对应的队列")
+
+
+async def select_slave_only(app: Client, call: Union[CallbackQuery, Message], **kwargs) -> tuple[str, str]:
+    """
+    高层级的选择后端api
+
+    return: (slaveid, comment)
+    """
+    timeout = 60
+    botmsg = await select_slave_only_pre(app, call, timeout=timeout, **kwargs)
+
+    recvkey = gen_msg_key(botmsg)
+    q = asyncio.Queue(1)
+    receiver[recvkey] = q
+
+    try:
+        async with async_timeout.timeout(timeout):
+            comment = await q.get()
+            slaveconfig = config.getSlaveconfig()
+            slaveid = ''
+            for k, v in slaveconfig.items():
+                if v.get('comment', '') == comment:
+                    slaveid = str(k)
+                    break
+            if slaveid and comment:
+                await botmsg.delete()
+                return str(slaveid), comment
+            else:
+                await botmsg.delete()
+                return '', comment
+
+    except asyncio.exceptions.TimeoutError:
+        print("获取超时")
+        return '', ''
+    finally:
+        receiver.pop(recvkey, None)
 
 
 async def select_slave(app: Client, call: CallbackQuery):
